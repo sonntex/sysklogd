@@ -684,22 +684,9 @@ struct filed {
 	char	f_prevhost[MAXHOSTNAMELEN+1];	/* host from which recd. */
 	int	f_prevpri;			/* pri of f_prevline */
 	int	f_prevlen;			/* length of f_prevline */
-	int	f_prevcount;			/* repetition cnt of prevline */
-	int	f_repeatcount;			/* number of "repeated" msgs */
 	int	f_flags;			/* store some additional flags */
 };
 
-/*
- * Intervals at which we flush out "message repeated" messages,
- * in seconds after previous message is logged.  After each flush,
- * we move to the next interval until we reach the largest.
- */
-int	repeatinterval[] = { 30, 60 };	/* # of secs before flush */
-#define	MAXREPEAT ((sizeof(repeatinterval) / sizeof(repeatinterval[0])) - 1)
-#define	REPEATTIME(f)	((f)->f_time + repeatinterval[(f)->f_repeatcount])
-#define	BACKOFF(f)	{ if (++(f)->f_repeatcount > MAXREPEAT) \
-				 (f)->f_repeatcount = MAXREPEAT; \
-			}
 #ifdef SYSLOG_INET
 #define INET_SUSPEND_TIME 180		/* equal to 3 minutes */
 #define INET_RETRY_MAX 10		/* maximum of retries for gethostbyname() */
@@ -1703,45 +1690,18 @@ void logmsg(pri, msg, from, flags)
 		if ((flags & MARK) && (now - f->f_time) < MarkInterval / 2)
 			continue;
 
-		/*
-		 * suppress duplicate lines to this file
-		 */
-		if ((flags & MARK) == 0 && msglen == f->f_prevlen &&
-		    !strcmp(msg, f->f_prevline) &&
-		    !strcmp(from, f->f_prevhost)) {
-			(void) strncpy(f->f_lasttime, timestamp, 15);
-			f->f_prevcount++;
-			dprintf("msg repeated %d times, %ld sec of %d.\n",
-			    f->f_prevcount, now - f->f_time,
-			    repeatinterval[f->f_repeatcount]);
-			/*
-			 * If domark would have logged this by now,
-			 * flush it now (so we don't hold isolated messages),
-			 * but back off so we'll flush less often
-			 * in the future.
-			 */
-			if (now > REPEATTIME(f)) {
-				fprintlog(f, (char *)from, flags, (char *)NULL);
-				BACKOFF(f);
-			}
+		f->f_prevpri = pri;
+		(void) strncpy(f->f_lasttime, timestamp, 15);
+		(void) strncpy(f->f_prevhost, from,
+				sizeof(f->f_prevhost));
+		if (msglen < MAXSVLINE) {
+			f->f_prevlen = msglen;
+			(void) strcpy(f->f_prevline, msg);
+			fprintlog(f, (char *)from, flags, (char *)NULL);
 		} else {
-			/* new line, save it */
-			if (f->f_prevcount)
-				fprintlog(f, (char *)from, 0, (char *)NULL);
-			f->f_prevpri = pri;
-			f->f_repeatcount = 0;
-			(void) strncpy(f->f_lasttime, timestamp, 15);
-			(void) strncpy(f->f_prevhost, from,
-					sizeof(f->f_prevhost));
-			if (msglen < MAXSVLINE) {
-				f->f_prevlen = msglen;
-				(void) strcpy(f->f_prevline, msg);
-				fprintlog(f, (char *)from, flags, (char *)NULL);
-			} else {
-				f->f_prevline[0] = 0;
-				f->f_prevlen = 0;
-				fprintlog(f, (char *)from, flags, msg);
-			}
+			f->f_prevline[0] = 0;
+			f->f_prevlen = 0;
+			fprintlog(f, (char *)from, flags, msg);
 		}
 	}
 #ifdef __gnu_linux__
@@ -1764,7 +1724,6 @@ void fprintlog(f, from, flags, msg)
 {
 	struct iovec iov[6];
 	register struct iovec *v = iov;
-	char repbuf[80];
 	ssize_t fwritten;
 #ifdef SYSLOG_INET
 	register int l;
@@ -1790,11 +1749,6 @@ void fprintlog(f, from, flags, msg)
 	if (msg) {
 		v->iov_base = msg;
 		v->iov_len = strlen(msg);
-	} else if (f->f_prevcount > 1) {
-		(void) snprintf(repbuf, sizeof(repbuf), "last message repeated %d times",
-		    f->f_prevcount);
-		v->iov_base = repbuf;
-		v->iov_len = strlen(repbuf);
 	} else {
 		v->iov_base = f->f_prevline;
 		v->iov_len = f->f_prevlen;
@@ -1841,18 +1795,11 @@ void fprintlog(f, from, flags, msg)
 			dprintf("Forwarding suspension to unknown over, retrying\n");
 			if ( (hp = gethostbyname(f->f_un.f_forw.f_hname)) == NULL ) {
 				dprintf("Failure: %s\n", sys_h_errlist[h_errno]);
-				dprintf("Retries: %d\n", f->f_prevcount);
-				if ( --f->f_prevcount < 0 ) {
-					dprintf("Giving up.\n");
-					f->f_type = F_UNUSED;
-				}
-				else
-					dprintf("Left retries: %d\n", f->f_prevcount);
+				f->f_type = F_UNUSED;
 			}
 			else {
 			        dprintf("%s found, resuming.\n", f->f_un.f_forw.f_hname);
 				memcpy((char *) &f->f_un.f_forw.f_addr.sin_addr, hp->h_addr, hp->h_length);
-				f->f_prevcount = 0;
 				f->f_type = F_FORW;
 				goto f_forw;
 			}
@@ -1980,8 +1927,6 @@ void fprintlog(f, from, flags, msg)
 		wallmsg(f, iov);
 		break;
 	} /* switch */
-	if (f->f_type != F_FORW_UNKN)
-		f->f_prevcount = 0;
 	return;		
 }
 #if FALSE
@@ -2202,32 +2147,12 @@ const char *cvthname(f)
 
 void domark()
 {
-	register struct filed *f;
-#ifdef SYSV
-	int lognum;
-#endif
-
 	if (MarkInterval > 0) {
 	now = time(0);
 	MarkSeq += TIMERINTVL;
 	if (MarkSeq >= MarkInterval) {
 		logmsg(LOG_MARK|LOG_INFO, "-- MARK --", LocalHostName, ADDDATE|MARK);
 		MarkSeq = 0;
-	}
-
-#ifdef SYSV
-	for (lognum = 0; lognum <= nlogs; lognum++) {
-		f = &Files[lognum];
-#else
-	for (f = Files; f; f = f->f_next) {
-#endif
-		if (f->f_prevcount && now >= REPEATTIME(f)) {
-			dprintf("flush %s: repeated %d times, %d sec.\n",
-			    TypeNames[f->f_type], f->f_prevcount,
-			    repeatinterval[f->f_repeatcount]);
-			fprintlog(f, LocalHostName, 0, (char *)NULL);
-			BACKOFF(f);
-		}
 	}
 	}
 	(void) signal(SIGALRM, domark);
@@ -2267,21 +2192,12 @@ void die(sig)
 	int sig;
 	
 {
-	register struct filed *f;
 	char buf[100];
-	int lognum;
 	int i;
 	int was_initialized = Initialized;
 
 	Initialized = 0;	/* Don't log SIGCHLDs in case we
 				   receive one during exiting */
-
-	for (lognum = 0; lognum <= nlogs; lognum++) {
-		f = &Files[lognum];
-		/* flush any pending output */
-		if (f->f_prevcount)
-			fprintlog(f, LocalHostName, 0, (char *)NULL);
-	}
 
 	Initialized = was_initialized;
 	if (sig) {
@@ -2367,10 +2283,6 @@ void init()
 
 		for (lognum = 0; lognum <= nlogs; lognum++ ) {
 			f = &Files[lognum];
-
-			/* flush any pending output */
-			if (f->f_prevcount)
-				fprintlog(f, LocalHostName, 0, (char *)NULL);
 
 			switch (f->f_type) {
 				case F_FILE:
@@ -2757,7 +2669,6 @@ void cfline(line, f)
 		dprintf("forwarding host: %s\n", p);	/*ASP*/
 		if ( (hp = gethostbyname(p)) == NULL ) {
 			f->f_type = F_FORW_UNKN;
-			f->f_prevcount = INET_RETRY_MAX;
 			f->f_time = time ( (time_t *)0 );
 		} else {
 			f->f_type = F_FORW;
