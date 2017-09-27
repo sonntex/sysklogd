@@ -500,6 +500,7 @@ static char sccsid[] = "@(#)syslogd.c	5.27 (Berkeley) 10/10/88";
 #define	MAXLINE		1024		/* maximum line length */
 #define	MAXSVLINE	240		/* maximum saved line length */
 #define	MAXFILE		1048576		/* maximum file length */
+#define	MAXNUMBER	10		/* maximum file number */
 #define DEFUPRI		(LOG_USER|LOG_NOTICE)
 #define DEFSPRI		(LOG_KERN|LOG_CRIT)
 #define TIMERINTVL	30		/* interval for checking flush, mark */
@@ -669,6 +670,7 @@ struct filed {
 	short	f_type;			/* entry type, see below */
 	short	f_file;			/* file descriptor */
 	ssize_t f_fwritten;		/* bytes that have been written to file */
+	int	f_findex;		/* current file index */
 	time_t	f_time;			/* time this was last written */
 	u_char	f_pmask[LOG_NFACILITIES+1];	/* priority mask */
 	union {
@@ -1935,17 +1937,22 @@ void fprintlog(f, from, flags, msg)
 
 void rotate(register struct filed *f)
 {
+	int i;
 	char path[256];
 	struct stat buf;
 
 	(void) close(f->f_file);
+
 	f->f_file = -1;
 	f->f_fwritten = 0;
 
-	stat(f->f_un.f_fname, &buf);
-	snprintf(path, sizeof(path), "%s-%lld%.9ld", f->f_un.f_fname, (long long)buf.st_ctim.tv_sec, (long)buf.st_ctim.tv_nsec);
-	unlink(path);
+	snprintf(path, sizeof(path), "%s.%i", f->f_un.f_fname, f->f_findex++);
 	rename(f->f_un.f_fname, path);
+
+	for (i = 0; i < f->f_findex - MAXNUMBER; ++i) {
+		snprintf(path, sizeof(path), "%s.%i", f->f_un.f_fname, i);
+		unlink(path);
+	}
 
 	f->f_file = open(f->f_un.f_fname, O_WRONLY|O_APPEND|O_CREAT|O_NONBLOCK|O_NOCTTY, 0644);
 	if (f->f_file < 0) {
