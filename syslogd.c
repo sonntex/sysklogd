@@ -499,6 +499,7 @@ static char sccsid[] = "@(#)syslogd.c	5.27 (Berkeley) 10/10/88";
 
 #define	MAXLINE		1024		/* maximum line length */
 #define	MAXSVLINE	240		/* maximum saved line length */
+#define	MAXFILE		1048576		/* maximum file length */
 #define DEFUPRI		(LOG_USER|LOG_NOTICE)
 #define DEFSPRI		(LOG_KERN|LOG_CRIT)
 #define TIMERINTVL	30		/* interval for checking flush, mark */
@@ -667,6 +668,7 @@ struct filed {
 #endif
 	short	f_type;			/* entry type, see below */
 	short	f_file;			/* file descriptor */
+	ssize_t f_fwritten;		/* bytes that have been written to file */
 	time_t	f_time;			/* time this was last written */
 	u_char	f_pmask[LOG_NFACILITIES+1];	/* priority mask */
 	union {
@@ -804,6 +806,7 @@ void printline(const char *hname, char *msg);
 void printsys(char *msg);
 void logmsg(int pri, char *msg, const char *from, int flags);
 void fprintlog(register struct filed *f, char *from, int flags, char *msg);
+void rotate(register struct filed *f);
 void endtty();
 void wallmsg(register struct filed *f, struct iovec *iov);
 void reapchild();
@@ -1762,6 +1765,7 @@ void fprintlog(f, from, flags, msg)
 	struct iovec iov[6];
 	register struct iovec *v = iov;
 	char repbuf[80];
+	ssize_t fwritten;
 #ifdef SYSLOG_INET
 	register int l;
 	char line[MAXLINE + 1];
@@ -1919,7 +1923,7 @@ void fprintlog(f, from, flags, msg)
 		if (f->f_file == -1)
 			break;
 
-		if (writev(f->f_file, iov, 6) < 0) {
+		if ((fwritten = writev(f->f_file, iov, 6)) < 0) {
 			int e = errno;
 
 			/* If a named pipe is full, just ignore it for now */
@@ -1956,8 +1960,15 @@ void fprintlog(f, from, flags, msg)
 				errno = e;
 				logerror(f->f_un.f_fname);
 			}
-		} else if (f->f_type == F_FILE && (f->f_flags & SYNC_FILE))
-			(void) fsync(f->f_file);
+		} else {
+			f->f_fwritten += fwritten;
+			if (f->f_type == F_FILE) {
+				if (f->f_flags & SYNC_FILE)
+					(void) fsync(f->f_file);
+				if (f->f_fwritten >= MAXFILE)
+					rotate(f);
+			}
+		}
 		break;
 
 	case F_USERS:
@@ -1976,6 +1987,27 @@ void fprintlog(f, from, flags, msg)
 #if FALSE
 }} /* balance parentheses for emacs */
 #endif
+
+void rotate(register struct filed *f)
+{
+	char path[256];
+	struct stat buf;
+
+	(void) close(f->f_file);
+	f->f_file = -1;
+	f->f_fwritten = 0;
+
+	stat(f->f_un.f_fname, &buf);
+	snprintf(path, sizeof(path), "%s-%lld%.9ld", f->f_un.f_fname, (long long)buf.st_ctim.tv_sec, (long)buf.st_ctim.tv_nsec);
+	unlink(path);
+	rename(f->f_un.f_fname, path);
+
+	f->f_file = open(f->f_un.f_fname, O_WRONLY|O_APPEND|O_CREAT|O_NONBLOCK|O_NOCTTY, 0644);
+	if (f->f_file < 0) {
+		f->f_file = -1;
+		return;
+	}
+}
 
 jmp_buf ttybuf;
 
